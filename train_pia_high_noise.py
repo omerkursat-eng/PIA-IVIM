@@ -114,14 +114,14 @@ def sample_sigma_high_noise_focus(step, warmup_steps, total_steps):
         else:
             return np.random.uniform(1e-2, 5e-2)
     
-    # After warmup: progressive shift to high noise
+    # After warmup: Focused fine-tuning with balanced retention
     progress = (step - warmup_steps) / (total_steps - warmup_steps)
     progress = min(progress, 1.0)
     
-    # Gradually increase high-noise probability
-    p_low = max(0.05, 0.20 - 0.15 * progress)   # 0.20 -> 0.05
-    p_mid = max(0.25, 0.50 - 0.25 * progress)   # 0.50 -> 0.25
-    p_high = min(0.70, 0.30 + 0.40 * progress)  # 0.30 -> 0.70
+    # Fine-tuning mode: High-noise focused but keep low-noise alive
+    p_low = max(0.05, 0.10 - 0.05 * progress)   # 0.10 -> 0.05 (keep alive to prevent forgetting)
+    p_mid = max(0.15, 0.20 - 0.05 * progress)   # 0.20 -> 0.15 (moderate presence)
+    p_high = min(0.80, 0.70 + 0.10 * progress)  # 0.70 -> 0.80 (dominant but not exclusive)
     
     # Normalize
     total = p_low + p_mid + p_high
@@ -133,8 +133,11 @@ def sample_sigma_high_noise_focus(step, warmup_steps, total_steps):
     elif r < p_low + p_mid:
         return np.random.uniform(1e-2, 5e-2)
     else:
-        # High noise - focus on 0.05 to 0.2 range
-        return np.random.uniform(5e-2, 2e-1)
+        # High noise - focused on problem region but cover full range
+        if np.random.rand() < 0.75:  # 75% in critical region
+            return np.random.uniform(8e-2, 2e-1)  # σ=0.08-0.2 (problem zone)
+        else:  # 25% in transition
+            return np.random.uniform(5e-2, 8e-2)  # σ=0.05-0.08 (bridge)
 
 
 # ----------------------------
@@ -178,7 +181,8 @@ def param_loss_robust(f_hat, dt_hat, ds_hat, f_gt, dt_gt, ds_gt, use_corr_loss=T
     l_mae_dt = F.smooth_l1_loss(edt, torch.zeros_like(edt))
     l_mae_ds = F.smooth_l1_loss(eds, torch.zeros_like(eds))
     
-    loss_mae = 0.35 * l_mae_f + 0.30 * l_mae_dt + 0.35 * l_mae_ds
+    # Increase D* weight since it has highest MAE
+    loss_mae = 0.30 * l_mae_f + 0.30 * l_mae_dt + 0.40 * l_mae_ds
     
     if use_corr_loss:
         # Correlation loss (for Spearman optimization)
@@ -186,7 +190,8 @@ def param_loss_robust(f_hat, dt_hat, ds_hat, f_gt, dt_gt, ds_gt, use_corr_loss=T
         l_corr_dt = correlation_loss(dt_hat, dt_gt)
         l_corr_ds = correlation_loss(ds_hat, ds_gt)
         
-        loss_corr = 0.35 * l_corr_f + 0.30 * l_corr_dt + 0.35 * l_corr_ds
+        # Same weights for correlation
+        loss_corr = 0.30 * l_corr_f + 0.30 * l_corr_dt + 0.40 * l_corr_ds
         
         return loss_mae + 0.5 * loss_corr
     
@@ -199,6 +204,9 @@ def param_loss_robust(f_hat, dt_hat, ds_hat, f_gt, dt_gt, ds_gt, use_corr_loss=T
 def main(args):
     os.makedirs(args.save_dir, exist_ok=True)
     
+    # Convert no_corr_loss to use_corr_loss
+    use_corr_loss = not args.no_corr_loss
+    
     # Device setup
     if args.device == "cuda" and not torch.cuda.is_available():
         print("Warning: CUDA not available, using CPU.")
@@ -207,7 +215,7 @@ def main(args):
     print(f"🚀 Training on: {device}")
     
     # Model
-    model = PIA(predictor_depth=args.predictor_depth, device=device).to(device)
+    model = PIA(predictor_depth=args.predictor_depth, device=device)
     
     params = (
         list(model.encoder.parameters()) +
@@ -218,9 +226,11 @@ def main(args):
     
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-5)
     
-    # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=args.max_steps // 4, T_mult=2
+    # Learning rate scheduler - Smooth cosine decay for stable high-noise training
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=args.max_steps - args.warmup_steps,  # Cosine decay after warmup
+        eta_min=5e-6  # Minimum LR (raised for fine-tuning stability)
     )
     
     # ----------------------------
@@ -231,7 +241,7 @@ def main(args):
     best_step = -1
     
     if args.resume and os.path.isfile(args.resume):
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_step = ckpt.get("step", 0)
@@ -264,6 +274,7 @@ def main(args):
     running_loss = 0.0
     t0 = time.time()
     no_improve = 0
+    step = start_step  # Initialize step variable
     
     for step in range(start_step + 1, args.max_steps + 1):
         model.train()
@@ -291,10 +302,14 @@ def main(args):
         loss_recon = model.loss_function(recon, clean)
         loss_param = param_loss_robust(
             f_hat, dt_hat, ds_hat, f_gt, dt_gt, ds_gt,
-            use_corr_loss=args.use_corr_loss
+            use_corr_loss=use_corr_loss
         )
         
         loss = loss_recon + args.lam_param * loss_param
+        
+        # Weighted loss for high-noise batches (Balanced fine-tuning)
+        if sigma >= 0.1:
+            loss = loss * 1.8  # 1.8x weight for high noise (balanced fine-tuning)
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -321,10 +336,10 @@ def main(args):
             
             # Evaluate on each sigma
             results = {}
-            for sigma in val_sigmas:
-                X, f, dt, ds = val_sets[sigma]
+            for val_sigma in val_sigmas:
+                X, f, dt, ds = val_sets[val_sigma]
                 m = evaluate_per_sigma(model, X, f, dt, ds)
-                results[sigma] = m
+                results[val_sigma] = m
             
             # Print MAE table (key for seeing linear behavior)
             print("\n📈 MAE vs Sigma (Target: Linear growth after σ=0.01)")
@@ -333,11 +348,11 @@ def main(args):
             print("-"*80)
             
             high_noise_maes = []
-            for sigma in val_sigmas:
-                m = results[sigma]
-                is_high = sigma >= 0.01
+            for val_sigma in val_sigmas:
+                m = results[val_sigma]
+                is_high = val_sigma >= 0.01
                 marker = "→" if is_high else " "
-                print(f"{marker} {sigma:>8.1e} | {m['mae_f']:>8.4f} | {m['mae_dt']:>8.4f} | {m['mae_ds']:>8.4f} | {m['rho_f']:>6.3f} | {m['rho_dt']:>6.3f} | {m['rho_ds']:>6.3f}")
+                print(f"{marker} {val_sigma:>8.1e} | {m['mae_f']:>8.4f} | {m['mae_dt']:>8.4f} | {m['mae_ds']:>8.4f} | {m['rho_f']:>6.3f} | {m['rho_dt']:>6.3f} | {m['rho_ds']:>6.3f}")
                 
                 if is_high:
                     # Aggregate high-noise performance
@@ -346,11 +361,16 @@ def main(args):
                         normalized_mae(m['mae_dt'], 0, 2.9) +
                         normalized_mae(m['mae_ds'], 0, 60)
                     ) / 3.0
-                    high_noise_maes.append(total_mae)
+                    
+                    # Give 2x weight to extreme high noise (σ >= 0.1)
+                    if val_sigma >= 0.1:
+                        high_noise_maes.append(total_mae * 2.0)  # Double penalty for σ≥0.1
+                    else:
+                        high_noise_maes.append(total_mae)
             
             print("-"*80)
             
-            # Calculate high-noise score (focus on σ >= 0.01)
+            # Calculate high-noise score (weighted toward σ >= 0.1)
             high_noise_score = np.mean(high_noise_maes) if high_noise_maes else float("inf")
             print(f"\n🎯 High-Noise Score (σ≥0.01): {high_noise_score:.6f}")
             
@@ -423,18 +443,18 @@ if __name__ == "__main__":
     
     # Loss
     parser.add_argument("--lam_param", type=float, default=1.0)
-    parser.add_argument("--use_corr_loss", action="store_true", default=True)
+    parser.add_argument("--no_corr_loss", action="store_true", help="Disable correlation loss")
     
     # Validation
     parser.add_argument("--eval_every", type=int, default=2500)
     parser.add_argument("--print_every", type=int, default=500)
     parser.add_argument("--val_samples_per_sigma", type=int, default=2000)
+    parser.add_argument("--patience", type=int, default=15, help="Early stopping patience (number of evaluations)")
     parser.add_argument("--val_seed", type=int, default=42)
     
     # Checkpointing
     parser.add_argument("--save_dir", type=str, default="pia_runs/high_noise_focus")
     parser.add_argument("--resume", type=str, default="")
-    parser.add_argument("--patience", type=int, default=10)
     
     args = parser.parse_args()
     main(args)

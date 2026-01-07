@@ -95,9 +95,6 @@ class PIA(nn.Module):
 
         S = (1 - f) * torch.exp(-b /1000* Dt) + f * torch.exp(-b /1000 * Dstar) #/1000
         return S.to(self.device)
-    
-
-    
 
     def forward(self, x):
         f, Dt, Dstar = self.encode(x)
