@@ -8,7 +8,7 @@ def ivim_fit_func(b, f, Dt, Dstar):
     return (1 - f) * np.exp(-b/1000 * Dt) + f * np.exp(-b/1000 * Dstar)
 
 
-def get_batch_optimized(batch_size=64, noise_sdt=0.01, normalize_b0=True):
+def get_batch_optimized(batch_size=32, noise_sdt=0.01, normalize_b0=True):
     # 1. b-values (s/mm^2)
     b_values = np.array([0, 5, 50, 100, 200, 500, 800, 1000], dtype=np.float32)
     
